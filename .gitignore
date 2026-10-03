@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 依赖与构建
+dist/
+build/
+*.egg
+
+# 本地数据库与索引（派生层，可重建，不入库）
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+zvec_state/
+index_state/
+state/
+
+# 模型与数据（体积大，本地专用）
+models/
+*.gguf
+*.safetensors
+*.onnx
+data/
+datasets/
+
+# 设备本地运行时（规范：真实测试样本永不进 git，路径 ~/llwwds_application/knowledge-vault/）
+testdata/
+hf_cache/
+
+# 日志与缓存
+*.log
+logs/
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# 配置与密钥
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# 系统
+.DS_Store
+
+# 临时
+tmp/
+temp/
+*.tmp

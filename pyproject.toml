@@ -1,0 +1,24 @@
+[project]
+name = "knowledge-vault"
+version = "0.1.0.0"
+description = "个人知识库后端：真源与索引分离的登记层（SQLite）+ 混合召回索引层（zvec/FTS5/图扩展），headless API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "zvec>=0.7.0",
+    "FlagEmbedding>=1.3.11",
+    "jieba>=0.42.1",
+    "numpy>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# 实施初期为实验/脚本项目，不构建安装包；coding 阶段形成正式包结构后再改回 package 模式
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
