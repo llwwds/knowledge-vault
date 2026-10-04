@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "knowledge-vault"
-version = "0.3.0.0"
+version = "0.4.0.0"
 description = "个人知识库后端：真源与索引分离的登记层（SQLite）+ 混合召回索引层（zvec/FTS5/图扩展），headless API"
 readme = "README.md"
 requires-python = ">=3.12"

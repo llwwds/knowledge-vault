@@ -40,6 +40,38 @@ tests/              # pytest 全套（合成数据 + tmp_path 隔离，不读真
 
 运行时配置（环境变量，均可在启动时注入）：`KV_STATE_DIR`（默认 `~/llwwds_application/knowledge-vault/state`）、`KV_VAULT_ROOT`（默认 `~/Documents/knowledge-vault_file`）、`KV_USERDICT`（默认包内 `data/userdict.txt`，置空禁用）、`KV_FILE_ID_SEED`（默认 1）。
 
+## Web 看板
+
+`kv-serve` 启动后，浏览器打开 `http://127.0.0.1:8770/ui` 即得单页看板（HTML/CSS/JS 全部内嵌在 `src/knowledge_vault/webui.py`，无第三方前端依赖、无 CDN 外链，离线可用）。看板提供：
+
+- **概览卡**：documents（total/active/deleted）、chunks（按 kind）、edges、向量库状态、db 体积与 state 路径、包版本与 schema 版本；每 30s 轮询 `GET /stats` 自动刷新。
+- **最近登记表**：file_id 倒序 20 条（title/status/path/mtime，软删除记录带标记），点击行或检索结果弹出 `GET /files/{id}` 详情。
+- **检索框**：调 `POST /search`，可开关 rerank、调 top-j，结果带 score 与 sources 徽标。
+- **optimize 按钮**：确认后触发 `POST /optimize`。
+
+### 皮肤系统
+
+皮肤 = 一组 CSS 变量（`--bg` / `--bg-elev` / `--fg` / `--fg-muted` / `--accent` / `--border` / `--danger` / `--radius` / `--font-sans` / `--font-mono`）+ 显示名，注册在后端 `THEMES` 注册表（`webui.py`）。顶栏切换器经 `GET /ui/theme.css?name=<name>` 拉取变量集即时换肤，选择写入 localStorage 记忆；`GET /ui?theme=<name>` 可在 URL 上指定皮肤，未知名字一律回退默认皮肤 `xai-dark`（xAI 审美：纯黑背景、白/浅灰文字、#222 极细边框、小圆角、大字距标题、等宽数字）。
+
+**自定义皮肤只需注册一个 CSS 变量集**，前端与路由自动生效：
+
+```python
+from knowledge_vault.webui import THEMES, REQUIRED_THEME_VARS, Theme, register_theme
+
+register_theme("paper-light", Theme(
+    display_name="Paper Light",
+    vars={
+        "--bg": "#ffffff", "--bg-elev": "#f5f5f5",
+        "--fg": "#111111", "--fg-muted": "#6f6f6f",
+        "--accent": "#111111", "--accent-fg": "#ffffff",
+        "--border": "#e0e0e0", "--danger": "#d4494f",
+        "--radius": "4px",
+        "--font-sans": "system-ui, sans-serif",
+        "--font-mono": "ui-monospace, Menlo, monospace",
+    },
+))
+```
+
 开发与测试在专属容器内进行（`bash dev/container/run.sh` 创建/重同步依赖），跑测试：
 
 ```bash

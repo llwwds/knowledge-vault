@@ -13,7 +13,13 @@
   服务端配置了 reranker 也跳过重排。
 - ``GET  /files/{file_id}`` → 登记记录原样返回（含软删除记录，``deleted_at``
   非空即软删除；调用方自行判断）。
+- ``GET  /files?limit=20``  → 最近登记列表（file_id 倒序，含软删除记录，
+  带 ``deleted_at`` 供调用方判断；``limit`` 默认 20，上限 500）。
 - ``POST /optimize``        → 触发 FTS/SQLite/zvec 索引优化，返回摘要。
+- ``GET  /stats``           → 只读运行统计（:func:`collect_stats` 原样 JSON）。
+- ``GET  /ui``              → 单页 web 看板（``?theme=<name>`` 指定皮肤，
+  未知名字回退默认皮肤 ``xai-dark``；皮肤系统见 :mod:`knowledge_vault.webui`）。
+- ``GET  /ui/theme.css``    → 皮肤 CSS（``?name=<name>``；未知名字回退默认）。
 
 并发模型：``ThreadingHTTPServer`` + **每请求独立 SQLite 连接**（WAL 允许多读
 并发，连接不跨线程复用）；写操作（optimize）由进程内互斥锁串行化——单线程化
@@ -25,13 +31,14 @@ from __future__ import annotations
 import json
 import os
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import zvec
 from zvec import HnswQueryParam
 
-from . import __version__
+from . import __version__, webui
 from .config import VaultConfig, load_config
 from .embedder import BGEM3Embedder
 from .protocols import Reranker
@@ -191,11 +198,18 @@ def collect_stats(config: VaultConfig) -> dict:
 # ------------------------------------------------------------------ HTTP 壳
 
 
+#: ``GET /files``（列表）单次返回的登记记录数上限
+_FILES_LIST_MAX = 500
+
 #: 各路径允许的 HTTP 方法（其余方法 → 405）
 _ALLOWED_METHODS = {
     "/health": {"GET"},
     "/search": {"POST"},
     "/optimize": {"POST"},
+    "/stats": {"GET"},
+    "/ui": {"GET"},
+    "/ui/theme.css": {"GET"},
+    "/files": {"GET"},
 }
 
 
@@ -225,6 +239,19 @@ class _ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, status: int, text: str, content_type: str) -> None:
+        """发送 UTF-8 文本响应（``GET /ui`` 的 HTML 与 ``/ui/theme.css`` 用）。"""
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _query(self) -> dict[str, list[str]]:
+        """解析 URL 查询串为 ``{key: [values]}``（无查询参数时空 dict）。"""
+        return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -246,8 +273,24 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     200, {"ok": True, "service": "knowledge-vault", "version": __version__}
                 )
+            elif path == "/ui":
+                requested_theme = (self._query().get("theme") or [None])[0]
+                self._send_text(
+                    200,
+                    webui.render_index(webui.resolve_theme(requested_theme)),
+                    "text/html; charset=utf-8",
+                )
+            elif path == "/ui/theme.css":
+                name = (self._query().get("name") or [None])[0]
+                self._send_text(
+                    200, webui.render_theme_css(name), "text/css; charset=utf-8"
+                )
+            elif path == "/stats":
+                self._send_json(200, collect_stats(self.config))
             elif path.startswith("/files/"):
                 self._handle_get_file(path)
+            elif path == "/files":
+                self._handle_list_files()
             else:
                 self._send_json(404, {"error": f"未知路径: {path}"})
         except Exception as exc:  # 防御：任何 handler 异常都回 500 而非断连
@@ -286,6 +329,39 @@ class _ApiHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": f"file_id 不存在: {file_id}"})
         else:
             self._send_json(200, doc.as_dict())
+
+    def _handle_list_files(self) -> None:
+        """``GET /files?limit=N``：最近登记列表（file_id 倒序，含软删除记录）。"""
+        raw = (self._query().get("limit") or ["20"])[0]
+        try:
+            limit = int(raw)
+        except ValueError:
+            self._send_json(400, {"error": f"limit 必须是整数，收到 {raw!r}"})
+            return
+        if limit <= 0:
+            self._send_json(400, {"error": "limit 必须是正整数"})
+            return
+        limit = min(limit, _FILES_LIST_MAX)
+        store = _open_store(self.config)
+        try:
+            docs = list(store.iterate_files())  # 含软删除，deleted_at 供调用方判断
+        finally:
+            store.close()
+        docs.reverse()  # iterate_files 按 file_id 升序 → 倒序即最近登记在前
+        files = [
+            {
+                "file_id": doc.file_id,
+                "title": doc.title,
+                "file_path": doc.file_path,
+                "file_type": doc.file_type,
+                "size_bytes": doc.size_bytes,
+                "status": doc.status,
+                "mtime": doc.mtime,
+                "deleted_at": doc.deleted_at,
+            }
+            for doc in docs[:limit]
+        ]
+        self._send_json(200, {"count": len(files), "files": files})
 
     def _handle_search(self) -> None:
         body = self._read_json_body()
