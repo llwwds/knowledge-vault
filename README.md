@@ -20,3 +20,28 @@
 这两个读者对「存储」和「检索」的要求互相冲突：人类要的是「文件 + 文件夹 + 编辑器」，agent 要的是「数据库 + 索引 + 查询」。knowledge-vault 用「真源与索引分离」的方式同时满足两者：真源保持人类友好的形态，索引层提供 agent 友好的形态，两者由一条摄入管线持续同步。
 
 一句话：**它是把散落的个人知识，变成一个可被准确、高性能地查询的「知识金库」的那层后端。**
+
+## 代码结构
+
+标准 Python 包（hatchling + src 布局），阶段1交付登记层 + 全文索引 + 图查询；zvec 向量库、摄入与召回管线由后续阶段交付。
+
+```
+src/knowledge_vault/
+├── config.py       # KV_* 环境变量注入 → VaultConfig（state 目录 / vault 根 / userdict / file_id 种子）
+├── schema.sql      # documents / chunks / edges / chunks_fts(FTS5) + 索引 DDL，schema_version 管理
+├── store.py        # 连接管理（WAL/foreign_keys）、建库与迁移、Store 薄门面
+├── file_id.py      # file_id 单调分配器（专用 counter 表，永不回收，KV_FILE_ID_SEED 可抬高起点）
+├── registry.py     # 登记：register_file / soft_delete / move_file / get / iterate（软删不过滤）
+├── textindex.py    # chunks 写入同步 FTS5（jieba 预分词 + userdict + span 预处理）、search / snippet
+├── graph.py        # edges 写入与递归 CTE 多跳扩展（UNION 去重口径）
+└── data/userdict.txt  # jieba 用户词典（随包打包，experiments/userdict_v0.txt 的拷贝）
+tests/              # pytest 全套（合成数据 + tmp_path 隔离，不读真实 vault/快照）
+```
+
+运行时配置（环境变量，均可在启动时注入）：`KV_STATE_DIR`（默认 `~/llwwds_application/knowledge-vault/state`）、`KV_VAULT_ROOT`（默认 `~/Documents/knowledge-vault_file`）、`KV_USERDICT`（默认包内 `data/userdict.txt`，置空禁用）、`KV_FILE_ID_SEED`（默认 1）。
+
+开发与测试在专属容器内进行（`bash dev/container/run.sh` 创建/重同步依赖），跑测试：
+
+```bash
+docker exec -w /repo knowledge-vault-dev /opt/venv/bin/python -m pytest
+```

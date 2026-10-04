@@ -1,6 +1,10 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "knowledge-vault"
-version = "0.1.0.0"
+version = "0.3.0.0"
 description = "个人知识库后端：真源与索引分离的登记层（SQLite）+ 混合召回索引层（zvec/FTS5/图扩展），headless API"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -11,14 +15,19 @@ dependencies = [
     "numpy>=2.0",
 ]
 
+[project.scripts]
+kv = "knowledge_vault.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
 ]
 
-[tool.uv]
-# 实施初期为实验/脚本项目，不构建安装包；coding 阶段形成正式包结构后再改回 package 模式
-package = false
+[tool.hatch.build.targets.wheel]
+packages = ["src/knowledge_vault"]
+# 包内数据资源必须随 wheel 分发（userdict 等）；防 .gitignore 规则误伤
+artifacts = ["src/knowledge_vault/data/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: 真实模型冒烟测试（默认跳过，环境变量 opt-in）"]

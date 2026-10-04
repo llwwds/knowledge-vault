@@ -21,12 +21,12 @@ zvec_state/
 index_state/
 state/
 
-# 模型与数据（体积大，本地专用）
+# 模型与数据（体积大，本地专用；/data 锚定仓库根，避免误伤包内资源如 src/knowledge_vault/data/）
 models/
 *.gguf
 *.safetensors
 *.onnx
-data/
+/data/
 datasets/
 
 # 设备本地运行时（规范：真实测试样本永不进 git，路径 ~/llwwds_application/knowledge-vault/）

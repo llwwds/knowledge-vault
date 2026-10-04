@@ -32,11 +32,10 @@ fi
 # ~/llwwds_application 语义对齐：容器内 expanduser('~') 指向挂载的运行时
 docker exec "$NAME" ln -sfn /app_runtime /root/llwwds_application
 
-# 依赖按 uv.lock 同步（幂等，锁更新后增量）
+# 依赖按 uv.lock 同步（幂等，锁更新后增量；开发容器含 dev 组——pytest 必须可用）
 docker exec -w /repo "$NAME" bash -c '
   if [ ! -x /opt/venv/bin/python ]; then uv venv /opt/venv --python 3.12; fi
-  VIRTUAL_ENV=/opt/venv uv sync --active --frozen --no-dev 2>/dev/null \
-    || VIRTUAL_ENV=/opt/venv uv sync --active --frozen
+  VIRTUAL_ENV=/opt/venv uv sync --active --frozen
 '
 
 docker exec "$NAME" /opt/venv/bin/python -c "import zvec, FlagEmbedding, jieba; print('container deps ok:', zvec.version('zvec'))"
