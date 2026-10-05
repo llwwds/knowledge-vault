@@ -730,6 +730,8 @@ class Ctx:
         self.embed_batch_texts = embed_batch_texts
         self.embed_queue: list[tuple[dict, list[int], list[str]]] = []
         self.stop = False
+        self.prune_target = False
+        self.prune_stats: dict | None = None
         self.since_flush = 0
         self.last_flush = time.time()
         self.t_copy = 0.0
@@ -1075,6 +1077,32 @@ def smoke_b0(ctx: Ctx) -> bool:
 
 # ---------------------------------------------------------------------- 收尾
 
+def prune_target(manifest: dict) -> dict:
+    """删除目标区内不在 manifest target 集合中的多余文件与空目录（镜像精确保养）。
+
+    用户授权口径：副本区旧内容在对账确认后删除，防止多份副本累积耗尽磁盘。
+    保留例外：README.md（目标区说明文件）。仅操作 VAULT_ROOT 内部。
+    """
+    targets = {r["target_rel_path"] for r in manifest.values()}
+    removed_files, removed_dirs = 0, 0
+    for dirpath, dirnames, filenames in os.walk(VAULT_ROOT, topdown=False):
+        rel_dir = Path(dirpath).relative_to(VAULT_ROOT).as_posix()
+        for name in filenames:
+            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+            if rel == "README.md" or rel in targets:
+                continue
+            (Path(dirpath) / name).unlink()
+            removed_files += 1
+        if rel_dir != ".":
+            try:
+                Path(dirpath).rmdir()  # 仅空目录成功
+                removed_dirs += 1
+            except OSError:
+                pass
+    log.info("prune_target 完成: 删除多余文件 %d 个、空目录 %d 个", removed_files, removed_dirs)
+    return {"removed_files": removed_files, "removed_dirs": removed_dirs}
+
+
 def finalize(ctx: Ctx) -> dict:
     """zvec optimize 一次 + FTS optimize/checkpoint + 最终冒烟 + 汇总报告。"""
     ctx.flush(force=True)
@@ -1279,7 +1307,7 @@ def smoke_final(queries: list[str]) -> None:
 
 def cmd_run(only: str | None, batches: str | None, *, embed_devices: str = "cpu",
             embed_threads: int = 8, embed_batch: int = 8,
-            embed_batch_texts: int = 64) -> None:
+            embed_batch_texts: int = 64, prune_target: bool = False) -> None:
     ctx = Ctx(embed_devices=embed_devices, embed_threads=embed_threads,
               embed_batch=embed_batch, embed_batch_texts=embed_batch_texts)
     ctx.manifest = load_manifest()
@@ -1326,6 +1354,8 @@ def cmd_run(only: str | None, batches: str | None, *, embed_devices: str = "cpu"
         if only == "B0":
             smoke_b0(ctx)
         elif not only and not batches and not ctx.stop:
+            if ctx.prune_target:
+                ctx.prune_stats = prune_target(ctx.manifest)
             finalize(ctx)
     finally:
         ctx.flush(force=True)
@@ -1394,6 +1424,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="encode 内部 forward 批大小")
     p_run.add_argument("--embed-batch-texts", type=int, default=64,
                        help="跨文件攒批触发阈值（队列文本数）")
+    p_run.add_argument("--prune-target", action="store_true",
+                       help="全量收尾前删除目标区内不在 manifest 中的多余文件（镜像精确保养，README.md 除外）")
     p_smoke = sub.add_parser("smoke-final", help="最终检索冒烟（3 中文查询跨目录）")
     p_smoke.add_argument("--queries", default=None, help="分号分隔，覆盖默认查询")
     sub.add_parser("status", help="manifest 状态速览")
@@ -1430,6 +1462,7 @@ def main(argv: list[str] | None = None) -> int:
             embed_threads=args.embed_threads,
             embed_batch=args.embed_batch,
             embed_batch_texts=args.embed_batch_texts,
+            prune_target=args.prune_target,
         )
     elif args.command == "smoke-final":
         queries = (

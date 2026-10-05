@@ -4,8 +4,9 @@
 
 - ``KV_STATE_DIR``     登记层 SQLite / 后续向量库等运行时产物的根目录
                        （默认 ``~/llwwds_application/knowledge-vault/state``，expanduser）
-- ``KV_VAULT_ROOT``    原文件真源根目录（默认 ``~/Documents/obsidian_file``，
-                       即用户 Obsidian 仓库原位置——单真源，系统对其零写入）
+- ``KV_VAULT_ROOT``    原文件真源根目录（默认 ``~/Documents/knowledge-vault_file``；
+                       Obsidian 仓库是人类编辑区，内容经入库落位同步进真源区，
+                       与开发/部署位置严格三分离）
 - ``KV_EXCLUDE_DIRS``  用户级排除目录（相对 vault_root 的目录路径，逗号分隔，
                        如 ``99 废纸篓,02 项目/某子目录``）；与各使用方的内置
                        业务排除（隐藏目录/.git 等）叠加生效
@@ -29,7 +30,7 @@ ENV_USERDICT = "KV_USERDICT"
 ENV_FILE_ID_SEED = "KV_FILE_ID_SEED"
 
 DEFAULT_STATE_DIR = "~/llwwds_application/knowledge-vault/state"
-DEFAULT_VAULT_ROOT = "~/Documents/obsidian_file"
+DEFAULT_VAULT_ROOT = "~/Documents/knowledge-vault_file"
 DEFAULT_FILE_ID_SEED = 1
 
 

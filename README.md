@@ -21,6 +21,18 @@
 
 一句话：**它是把散落的个人知识，变成一个可被准确、高性能地查询的「知识金库」的那层后端。**
 
+## 版本语义（一级版本号）
+
+- **v1.x —— 知识库就是我的 Obsidian 仓库**：知识以 md 文件形式散落在 Obsidian vault 中，检索靠 Obsidian 自身，没有索引层。
+- **v2.x —— 知识库就是诸位眼前的这个系统（knowledge-vault）**：Obsidian 仓库回归「人类编辑界面」，knowledge-vault 在旁维护原文件真源区（`~/Documents/knowledge-vault_file/`，与开发/部署位置严格三分离）与可随时重建的派生索引层，对外提供 CLI / HTTP API / web 看板 / agent skill。
+
+| 位置 | 角色 |
+|---|---|
+| `~/Documents/obsidian_file/` | 人类编辑区（Obsidian 仓库，内容源头） |
+| `~/Documents/knowledge-vault_file/` | **原文件真源区**（入库落位，系统索引的对象） |
+| `~/Documents/code_file/knowledge-vault/` | 开发仓库（代码/测试/实验，本 README 所在） |
+| `~/llwwds_application/knowledge-vault/` | 部署实例（应用本体 + state/索引 + 模型缓存） |
+
 ## 代码结构
 
 标准 Python 包（hatchling + src 布局），阶段1交付登记层 + 全文索引 + 图查询；zvec 向量库、摄入与召回管线由后续阶段交付。

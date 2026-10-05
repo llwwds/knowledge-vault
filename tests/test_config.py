@@ -26,8 +26,8 @@ class TestDefaults:
         assert cfg.state_dir == Path(
             "~/llwwds_application/knowledge-vault/state"
         ).expanduser()
-        # 单真源：默认指向用户 Obsidian 仓库原位置（系统对其零写入）
-        assert cfg.vault_root == Path("~/Documents/obsidian_file").expanduser()
+        # 真源区：knowledge-vault_file（与开发/部署位置严格三分离）
+        assert cfg.vault_root == Path("~/Documents/knowledge-vault_file").expanduser()
         assert "~" not in str(cfg.state_dir)
         assert "~" not in str(cfg.vault_root)
 
