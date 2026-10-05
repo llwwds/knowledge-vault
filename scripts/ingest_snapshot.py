@@ -1401,19 +1401,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser = argparse.ArgumentParser(
-        description="knowledge-vault 入库（默认原地登记 Obsidian 真源；--source 指向副本/快照则走落位模式）"
+        description="knowledge-vault 入库（默认落位模式：源 obsidian_file → 目标 knowledge-vault_file；--in-place 原地登记）"
     )
-    for p in (sub := parser.add_subparsers(dest="command", required=True)).choices.values():
-        p.add_argument("--source", default=None, metavar="PATH",
-                       help="入库源根目录（默认 ~/Documents/obsidian_file）")
-        p.add_argument("--vault-root", default=None, metavar="PATH",
-                       help="目标区根目录（默认 ~/Documents/knowledge-vault_file；--in-place 时忽略）")
-        p.add_argument("--in-place", action="store_true",
-                       help="原地登记：零拷贝、绝不写源文件（frontmatter 改写强制关闭）")
-        p.add_argument("--no-fm-write", action="store_true",
-                       help="跳过 frontmatter 改写（登记信息只进索引层）")
-        p.add_argument("--exclude-dir", action="append", default=None, metavar="RELPATH",
-                       help="用户级排除目录（相对源根，可重复）；另读 KV_EXCLUDE_DIRS（逗号分隔）")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_gen = sub.add_parser("generate", help="生成 manifest（全量 sha256 + file_id 预分配）")
     p_gen.add_argument("--regenerate", action="store_true")
     p_run = sub.add_parser("run", help="执行批次（默认 B0→B7 全量 + 收尾）")
     p_run.add_argument("--only", choices=BATCH_ORDER, default=None)
@@ -1430,6 +1421,17 @@ def main(argv: list[str] | None = None) -> int:
     p_smoke.add_argument("--queries", default=None, help="分号分隔，覆盖默认查询")
     sub.add_parser("status", help="manifest 状态速览")
     sub.add_parser("report", help="基于 manifest + 库的汇总报告")
+    for p in sub.choices.values():
+        p.add_argument("--source", default=None, metavar="PATH",
+                       help="入库源根目录（默认 ~/Documents/obsidian_file）")
+        p.add_argument("--vault-root", default=None, metavar="PATH",
+                       help="目标区根目录（默认 ~/Documents/knowledge-vault_file；--in-place 时忽略）")
+        p.add_argument("--in-place", action="store_true",
+                       help="原地登记：零拷贝、绝不写源文件（frontmatter 改写强制关闭）")
+        p.add_argument("--no-fm-write", action="store_true",
+                       help="跳过 frontmatter 改写（登记信息只进索引层）")
+        p.add_argument("--exclude-dir", action="append", default=None, metavar="RELPATH",
+                       help="用户级排除目录（相对源根，可重复）；另读 KV_EXCLUDE_DIRS（逗号分隔）")
     args = parser.parse_args(argv)
 
     # CLI 参数 → 运行模式全局覆盖（须在调度前完成）
