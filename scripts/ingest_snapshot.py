@@ -264,9 +264,7 @@ def parse_fm_date(value: str | None) -> str | None:
     if not v:
         return None
     dt = None
-    has_time = any(c in v for c in "T :") and not v.endswith("Z") or any(
-        c in v for c in "T:"
-    )
+    has_time = ":" in v  # 含时间部分的形态必带冒号（HH:MM）；纯日期不带
     try:
         dt = datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
     except ValueError:
@@ -352,11 +350,10 @@ def build_rewritten(
 
 def rewrite_frontmatter(
     dst: Path, row: dict, *, title: str, context_tag_json: str
-) -> tuple[str, str, str, bool] | None:
-    """对目标 md 做只加不改改写。返回 (content_hash12, created_at, mtime_iso, rewritten)。
-
-    返回 None 表示无法安全改写（非 UTF-8），调用方按未改写处理。
-    """
+) -> tuple[str, str, str, bool, str | None] | None:
+    """对目标 md 做只加不改改写。返回 (content_hash12, created_at, mtime_iso,
+    rewritten, fm_title)。fm_title 为 frontmatter 中非空 title（登记 title 优先取它，
+    规则文档五节 5.5）；无法安全改写（非 UTF-8）返回 None。"""
     st = dst.stat()
     mtime_iso = utc_iso(st.st_mtime)
     raw = dst.read_bytes()
@@ -366,6 +363,10 @@ def rewrite_frontmatter(
         return None
     fm, _ = split_frontmatter(text)
     keys = _fm_top_keys(fm) if fm else {}
+    fm_title = None
+    existing_title = (keys.get("title") or "").strip().strip('"').strip("'").strip()
+    if existing_title:
+        fm_title = existing_title
     created_at = mtime_iso
     for k in FM_DATE_KEYS:
         parsed = parse_fm_date(keys.get(k))
@@ -387,7 +388,7 @@ def rewrite_frontmatter(
         modified_at=modified_at,
     )
     if new_text is None:  # 7 字段齐备，无需改写
-        return sha256_file(dst)[:12], created_at, mtime_iso, False
+        return sha256_file(dst)[:12], created_at, mtime_iso, False, fm_title
     new_bytes = new_text.encode("utf-8")
     content_hash = hashlib.sha256(new_bytes).hexdigest()[:12]
     # 备份原文件副本（设备本地，规则文档六节 6.5）
@@ -402,7 +403,7 @@ def rewrite_frontmatter(
     finally:
         tmp.unlink(missing_ok=True)
     os.utime(dst, (st.st_atime, st.st_mtime))
-    return content_hash, created_at, mtime_iso, True
+    return content_hash, created_at, mtime_iso, True, fm_title
 
 
 # ------------------------------------------------------------------- manifest
@@ -683,13 +684,25 @@ def cmd_generate(regenerate: bool) -> None:
 # ------------------------------------------------------------------------ run
 
 class Ctx:
-    """运行上下文：Store / ZvecStore / Embedder 懒加载 + 计时 + 停止旗标。"""
+    """运行上下文：Store / ZvecStore / Embedder 懒加载 + 计时 + 停止旗标。
 
-    def __init__(self) -> None:
+    embedding 攒批：向量写入按「跨文件队列」攒到 ``embed_batch_texts`` 条再一次性
+    encode（FlagEmbedding 调用内自带按长度排序），减少每文件固定开销；批内文件
+    保持 state=registered 直到向量落库成功才置 indexed（崩溃后按 registered 重做，
+    配合 index_row 的先清后写保证幂等）。
+    """
+
+    def __init__(self, embed_devices: str = "cpu", embed_threads: int = 8,
+                 embed_batch: int = 8, embed_batch_texts: int = 64) -> None:
         self.manifest: dict[str, dict] = {}
         self.store: Store | None = None
         self.zvec: ZvecStore | None = None
         self.embedder: BGEM3Embedder | None = None
+        self.embed_devices = embed_devices
+        self.embed_threads = embed_threads
+        self.embed_batch = embed_batch
+        self.embed_batch_texts = embed_batch_texts
+        self.embed_queue: list[tuple[dict, list[int], list[str]]] = []
         self.stop = False
         self.since_flush = 0
         self.last_flush = time.time()
@@ -718,8 +731,13 @@ class Ctx:
 
     def ensure_embedder(self) -> BGEM3Embedder:
         if self.embedder is None:
-            log.info("加载 bge-m3 embedder（首次 encode 惰性加载 torch/FlagEmbedding）...")
-            self.embedder = BGEM3Embedder()
+            log.info("加载 bge-m3 embedder（devices=%s threads=%d batch=%d）...",
+                     self.embed_devices, self.embed_threads, self.embed_batch)
+            self.embedder = BGEM3Embedder(
+                batch_size=self.embed_batch,
+                threads=self.embed_threads,
+                devices=self.embed_devices,
+            )
         return self.embedder
 
     def flush(self, force: bool = False) -> None:
@@ -790,7 +808,9 @@ def register_row(ctx: Ctx, row: dict) -> None:
             ctx.fm_skipped_decode += 1
             log.warning("非 UTF-8 md，跳过 frontmatter 改写: %s", row["target_rel_path"])
         else:
-            content_hash, created_at, mtime_iso, rewritten = result
+            content_hash, created_at, mtime_iso, rewritten, fm_title = result
+            if fm_title:  # 规则文档五节 5.5：fm title 非空优先
+                title = fm_title
             if rewritten:
                 ctx.fm_rewritten += 1
                 st = dst.stat()
@@ -834,27 +854,68 @@ def register_row(ctx: Ctx, row: dict) -> None:
 
 
 def index_row(ctx: Ctx, row: dict) -> int:
-    """切块 + FTS +（未被排除时）embedding + zvec。返回 chunk 数。"""
+    """切块 + FTS +（未被排除时）攒批 embedding + zvec。返回 chunk 数。
+
+    幂等：先清旧（FTS chunks + 向量）再重写（与运行期管线同语义）。向量写入
+    走跨文件攒批队列，本文件保持 registered 直到向量落库（见 flush_embed_queue）。
+    """
     t0 = time.time()
     dst = VAULT_ROOT / row["target_rel_path"]
     ext = dst.suffix.lower()
     text = dst.read_text(encoding="utf-8", errors="replace")
     chunks = chunk_markdown(text) if ext in MARKDOWN_EXTENSIONS else chunk_plain(text)
     n = len(chunks)
+    store = ctx.ensure_store()
+    store.delete_chunks_for_file(row["file_id"])  # 幂等清旧（空则 no-op）
+    if vector_eligible(row):
+        ctx.ensure_zvec().delete_file(row["file_id"])  # 幂等清旧（无向量则 no-op）
     if n == 0:
         ctx.t_index += time.time() - t0
         return 0
     texts = [c.text for c in chunks]
-    ctx.ensure_store().add_chunks(row["file_id"], texts)  # FTS（chunks 表 + chunks_fts）
-    if vector_eligible(row):
-        te = time.time()
-        vecs = ctx.ensure_embedder().encode(texts)
-        ctx.t_embed += time.time() - te
-        ctx.ensure_zvec().upsert_chunks(
-            row["file_id"], [c.seq for c in chunks], vecs, ["chunk"] * n
-        )
+    store.add_chunks(row["file_id"], texts)  # FTS（chunks 表 + chunks_fts）
+    if not vector_eligible(row):
+        # 无向量资格（Q9/Q10 排除或登记类）：FTS 即终态
+        ctx.t_index += time.time() - t0
+        return n
+    ctx.embed_queue.append((row, [c.seq for c in chunks], texts))
     ctx.t_index += time.time() - t0
     return n
+
+
+def flush_embed_queue(ctx: Ctx, stats: Counter, *, force: bool = False) -> None:
+    """攒批 encode + 按文件回写向量；队列文本数达阈值或批次结束时调用。"""
+    queued = ctx.embed_queue
+    if not queued:
+        return
+    total = sum(len(texts) for _, _, texts in queued)
+    if not force and total < ctx.embed_batch_texts:
+        return
+    texts_all: list[str] = []
+    spans: list[tuple[dict, list[int], int, int]] = []
+    for row, seqs, texts in queued:
+        spans.append((row, seqs, len(texts_all), len(texts_all) + len(texts)))
+        texts_all.extend(texts)
+    try:
+        te = time.time()
+        vecs = ctx.ensure_embedder().encode(texts_all)
+        ctx.t_embed += time.time() - te
+        z = ctx.ensure_zvec()
+        for row, seqs, s, e in spans:
+            z.upsert_chunks(row["file_id"], seqs, vecs[s:e], ["chunk"] * len(seqs))
+            row["state"] = "indexed"
+            stats["indexed"] += 1
+            stats["vector"] += 1
+        log.info("向量攒批落库: %d 文件 / %d chunks（累计 embed %.0fs）",
+                 len(spans), total, ctx.t_embed)
+    except Exception as exc:  # noqa: BLE001 — 攒批失败整批标 failed，断点重做
+        for row, _, _, _ in spans:
+            row["state"] = "failed"
+            row["error"] = f"embed_batch: {type(exc).__name__}: {exc}"
+            stats["failed"] += 1
+        log.exception("向量攒批失败（%d 文件 / %d chunks）", len(spans), total)
+    finally:
+        ctx.embed_queue = []
 
 
 def process_row(ctx: Ctx, row: dict, stats: Counter) -> None:
@@ -872,10 +933,13 @@ def process_row(ctx: Ctx, row: dict, stats: Counter) -> None:
         # state == registered → 索引（有资格才做）
         if index_eligible(row):
             row["chunks"] = index_row(ctx, row)
-            row["state"] = "indexed"
-            stats["indexed"] += 1
-            if vector_eligible(row):
-                stats["vector"] += 1
+            if not vector_eligible(row) or not row["chunks"]:
+                # Q9/Q10 排除或登记类：FTS 即终态；0 chunk 文件无可嵌入内容
+                row["state"] = "indexed"
+                stats["indexed"] += 1
+                if not vector_eligible(row):
+                    stats["fts_only"] += 1
+            # 向量资格文件：state 由 flush_embed_queue 推进为 indexed
         else:
             stats["registered_only"] += 1
     except Exception as exc:  # noqa: BLE001 — 单文件失败不阻塞批次
@@ -884,6 +948,7 @@ def process_row(ctx: Ctx, row: dict, stats: Counter) -> None:
         stats["failed"] += 1
         log.exception("处理失败: %s", row["target_rel_path"])
     finally:
+        flush_embed_queue(ctx, stats)
         ctx.since_flush += 1
         ctx.flush()
 
@@ -906,6 +971,8 @@ def run_batch(ctx: Ctx, batch: str, rows: list[dict]) -> Counter:
             done_since_log = 0
             log.info("[%s] 进度: %s", batch, dict(stats))
     # 批内失败重试（attempts 未达上限）
+    if ctx.stop:
+        flush_embed_queue(ctx, stats, force=True)  # 停止前把已入队向量落库
     retryable = [r for r in todo
                  if r["state"] == "failed" and r.get("attempts", 0) < MAX_ATTEMPTS]
     if retryable and not ctx.stop:
@@ -914,6 +981,7 @@ def run_batch(ctx: Ctx, batch: str, rows: list[dict]) -> Counter:
             if ctx.stop:
                 break
             process_row(ctx, row, stats)
+    flush_embed_queue(ctx, stats, force=True)  # 批末强制落向量
     ctx.flush(force=True)
     log.info(
         "[%s] 批次完成: %s | 耗时 %.1fs（copy %.1fs / register %.1fs / index %.1fs / embed %.1fs）",
@@ -1173,8 +1241,11 @@ def smoke_final(queries: list[str]) -> None:
 
 # ----------------------------------------------------------------------- main
 
-def cmd_run(only: str | None, batches: str | None) -> None:
-    ctx = Ctx()
+def cmd_run(only: str | None, batches: str | None, *, embed_devices: str = "cpu",
+            embed_threads: int = 8, embed_batch: int = 8,
+            embed_batch_texts: int = 64) -> None:
+    ctx = Ctx(embed_devices=embed_devices, embed_threads=embed_threads,
+              embed_batch=embed_batch, embed_batch_texts=embed_batch_texts)
     ctx.manifest = load_manifest()
 
     def _handle_stop(signum, frame):  # noqa: ANN001
@@ -1270,6 +1341,12 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="执行批次（默认 B0→B7 全量 + 收尾）")
     p_run.add_argument("--only", choices=BATCH_ORDER, default=None)
     p_run.add_argument("--batches", default=None, help="逗号分隔，如 B2,B3（不收尾）")
+    p_run.add_argument("--embed-devices", default="cpu", choices=["cpu", "mps"])
+    p_run.add_argument("--embed-threads", type=int, default=8)
+    p_run.add_argument("--embed-batch", type=int, default=8,
+                       help="encode 内部 forward 批大小")
+    p_run.add_argument("--embed-batch-texts", type=int, default=64,
+                       help="跨文件攒批触发阈值（队列文本数）")
     p_smoke = sub.add_parser("smoke-final", help="最终检索冒烟（3 中文查询跨目录）")
     p_smoke.add_argument("--queries", default=None, help="分号分隔，覆盖默认查询")
     sub.add_parser("status", help="manifest 状态速览")
@@ -1280,7 +1357,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "generate":
         cmd_generate(args.regenerate)
     elif args.command == "run":
-        cmd_run(args.only, args.batches)
+        cmd_run(
+            args.only, args.batches,
+            embed_devices=args.embed_devices,
+            embed_threads=args.embed_threads,
+            embed_batch=args.embed_batch,
+            embed_batch_texts=args.embed_batch_texts,
+        )
     elif args.command == "smoke-final":
         queries = (
             [q.strip() for q in args.queries.split(";") if q.strip()]
