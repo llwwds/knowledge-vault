@@ -49,7 +49,7 @@ from .textindex import (
     snippet,
 )
 
-__version__ = "2.4.1.1"
+__version__ = "2.5.0.0"
 
 __all__ = [
     # config

@@ -84,6 +84,10 @@ register_theme("paper-light", Theme(
 ))
 ```
 
+## Agent skill
+
+`integrations/zcode-skill/knowledge-vault/` 提供 agent 低阻力检索入口（ZCode/Codex skill 格式）：`scripts/kv.py` 一条命令完成「服务探测 → 离线自动拉起 → HTTP 检索 → 失败回退 CLI」全链，`search "查询" [--rerank] [--tag] [--json]` / `stats` / `file <id>` / `serve-start`。只读边界：知识库内容的唯一写入路径是用户编辑 Obsidian → 入库落位 → 自动索引。部署：拷贝该目录至 agent 的 skills 目录（如 `~/.agents/skills/knowledge-vault/`）。
+
 开发与测试在专属容器内进行（`bash dev/container/run.sh` 创建/重同步依赖），跑测试：
 
 ```bash
