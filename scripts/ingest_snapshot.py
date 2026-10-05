@@ -76,10 +76,12 @@ from knowledge_vault.vectorstore import ZvecStore
 
 # ------------------------------------------------------------------ 路径常量
 
-SNAPSHOT_ROOT = Path(
-    "/Users/llwwds/Documents/obsidian仓库快照备份/"
-    "2026.10.4 新版知识库第一次数据入库用/obsidian_file"
-)
+#: 入库源根（默认 = 用户 Obsidian 仓库原位置，单真源）。--source 可覆盖
+#: （如指向历史快照做副本区落位）；一律用 ~ 形态，不写入个人绝对路径。
+SNAPSHOT_ROOT = Path("~/Documents/obsidian_file")
+
+#: 目标区根：--in-place（原地登记）时 = SNAPSHOT_ROOT（零拷贝、零写入 vault）；
+#: 否则为副本区（历史快照落位模式）。
 VAULT_ROOT = Path("~/Documents/knowledge-vault_file").expanduser()
 STATE_DIR = Path("~/llwwds_application/knowledge-vault/state").expanduser()
 TESTDATA_DIR = Path("~/llwwds_application/knowledge-vault/testdata").expanduser()
@@ -91,7 +93,24 @@ BACKUP_DIR = STATE_DIR / "ingest_fm_backup"
 SMOKE_MARKER = STATE_DIR / "ingest_b0_smoke.json"
 REPORT_PATH = STATE_DIR / "ingest_report.json"
 GEN_STATS_PATH = STATE_DIR / "ingest_generate_stats.json"
-ERRORS_PATH = TESTDATA_DIR / "ingest_errors_20261005.json"
+
+def _errors_path() -> Path:
+    return TESTDATA_DIR / f"ingest_errors_{time.strftime('%Y%m%d')}.json"
+
+# ------------------------------------------------------------------ 运行模式（main 按 CLI 参数覆盖）
+
+#: 原地登记：source == vault_root，零拷贝、绝不写 vault 文件（frontmatter 改写强制关闭）
+IN_PLACE = False
+#: frontmatter 只加不改的总开关（原地模式强制 False）
+FM_WRITE = True
+#: 用户级路径排除（相对源根的 posix 目录路径；--exclude-dir 与 KV_EXCLUDE_DIRS 合并）
+USER_EXCLUDE_RELPATHS: set[str] = set()
+
+
+def rel_excluded(rel_dir: str, dirname: str) -> bool:
+    """判断 (rel_dir, dirname) 组成的目录相对路径是否命中用户路径排除。"""
+    rel = f"{rel_dir}/{dirname}" if rel_dir and rel_dir != "." else dirname
+    return rel in USER_EXCLUDE_RELPATHS
 
 # ------------------------------------------------------------------ 规则常量
 
@@ -458,9 +477,11 @@ def walk_snapshot() -> tuple[list[dict], list[dict], dict]:
     stats = {"files_seen": 0, "excluded_hidden": 0, "excluded_meta": 0,
              "unexpected_root": 0}
     for dirpath, dirnames, filenames in os.walk(SNAPSHOT_ROOT):
+        rel_dir = Path(dirpath).relative_to(SNAPSHOT_ROOT).as_posix()
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in EXCLUDE_DIR_NAMES and not d.startswith(".")
+            and not rel_excluded(rel_dir, d)
         )
         for name in sorted(filenames):
             if name.startswith("."):
@@ -480,14 +501,17 @@ def walk_snapshot() -> tuple[list[dict], list[dict], dict]:
                 trash.append({"source_rel_path": rel, "target_rel_path": rel,
                               "size_bytes": size})
                 continue
-            if "/" not in rel:  # 根部文件：走特例重定向表
-                target = ROOT_REDIRECTS.get(name)
-                if target is None:
-                    stats["unexpected_root"] += 1
-                    included.append({"source_rel_path": rel, "target_rel_path": rel,
-                                     "size_bytes": size, "_unexpected_root": True})
-                    continue
-                target = target
+            if "/" not in rel:  # 根部文件：副本模式走特例重定向表；原地模式登记原位
+                if IN_PLACE:
+                    target = rel
+                else:
+                    target = ROOT_REDIRECTS.get(name)
+                    if target is None:
+                        stats["unexpected_root"] += 1
+                        included.append({"source_rel_path": rel, "target_rel_path": rel,
+                                         "size_bytes": size, "_unexpected_root": True})
+                        continue
+                    target = target
             else:
                 target = rel
             included.append({"source_rel_path": rel, "target_rel_path": target,
@@ -505,12 +529,14 @@ def collect_empty_dirs(included: list[dict]) -> list[str]:
             non_empty.add("/".join(parts[:i]))
     dirs: list[str] = []
     for dirpath, dirnames, filenames in os.walk(SNAPSHOT_ROOT):
+        walk_rel_dir = Path(dirpath).relative_to(SNAPSHOT_ROOT).as_posix()
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in EXCLUDE_DIR_NAMES and not d.startswith(".")
             and not (dirpath == str(SNAPSHOT_ROOT) and d == TRASH_TOP)
+            and not rel_excluded(walk_rel_dir, d)
         )
-        rel_dir = Path(dirpath).relative_to(SNAPSHOT_ROOT).as_posix()
+        rel_dir = walk_rel_dir
         if rel_dir == ".":
             continue
         if rel_dir not in non_empty:
@@ -766,12 +792,21 @@ def needs_work(row: dict) -> bool:
 
 
 def ensure_copied(ctx: Ctx, row: dict) -> bool:
-    """拷贝（保 mtime）→ sha256 校验（失败重试 1 次，规则文档九节 9.3）。"""
+    """拷贝（保 mtime）→ sha256 校验（失败重试 1 次，规则文档九节 9.3）。
+
+    原地模式（IN_PLACE）：源即目标，零拷贝，仅对现文件复验 manifest sha256。
+    """
     t0 = time.time()
     src = SNAPSHOT_ROOT / row["source_rel_path"]
-    dst = VAULT_ROOT / row["target_rel_path"]
-    dst.parent.mkdir(parents=True, exist_ok=True)
     try:
+        if IN_PLACE:
+            if sha256_file(src) == row["sha256_source"]:
+                return True
+            row["state"] = "failed"
+            row["error"] = "sha256 与 manifest 不一致（原地模式不拷贝，请人工核对源文件变更）"
+            return False
+        dst = VAULT_ROOT / row["target_rel_path"]
+        dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists() and sha256_file(dst) == row["sha256_source"]:
             return True
         for attempt in range(2):  # 首次 + 重试 1 次
@@ -787,9 +822,9 @@ def ensure_copied(ctx: Ctx, row: dict) -> bool:
 
 
 def register_row(ctx: Ctx, row: dict) -> None:
-    """frontmatter 只加不改（md，041/042 除外）→ 直接写 documents（引导例外）。"""
+    """frontmatter 只加不改（md，041/042 除外；原地模式强制不改写）→ 写 documents。"""
     t0 = time.time()
-    dst = VAULT_ROOT / row["target_rel_path"]
+    dst = (SNAPSHOT_ROOT if IN_PLACE else VAULT_ROOT) / row["target_rel_path"]
     st = dst.stat()
     mtime_iso = utc_iso(st.st_mtime)
     size = st.st_size
@@ -800,7 +835,7 @@ def register_row(ctx: Ctx, row: dict) -> None:
 
     ext = dst.suffix.lower()
     is_md = ext in MARKDOWN_EXTENSIONS
-    if is_md and not is_041_042(row["target_rel_path"]):
+    if is_md and not is_041_042(row["target_rel_path"]) and FM_WRITE and not IN_PLACE:
         result = rewrite_frontmatter(
             dst, row, title=title, context_tag_json=tag_json
         )
@@ -1150,8 +1185,9 @@ def build_report(ctx: Ctx, timings: dict) -> dict:
         == conservation["db_documents"]
         and conservation["manifest_chunks"] == conservation["db_chunks"]
     )
-    ERRORS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ERRORS_PATH.write_text(
+    errors_path = _errors_path()
+    errors_path.parent.mkdir(parents=True, exist_ok=True)
+    errors_path.write_text(
         json.dumps(
             {
                 "failed": [
@@ -1183,7 +1219,7 @@ def build_report(ctx: Ctx, timings: dict) -> dict:
         "failed_count": len(failed_rows),
         "conflict_count": len(conflict_rows),
         "sha256_verify_failed": len(sha_fail),
-        "errors_file": str(ERRORS_PATH),
+        "errors_file": str(errors_path),
         "fm": {"rewritten": ctx.fm_rewritten,
                "decode_skip": ctx.fm_skipped_decode},
         "timings": timings,
@@ -1334,9 +1370,20 @@ def main(argv: list[str] | None = None) -> int:
         ],
     )
 
-    parser = argparse.ArgumentParser(description="knowledge-vault 快照引导入库")
-    sub = parser.add_subparsers(dest="command", required=True)
-    p_gen = sub.add_parser("generate", help="生成 manifest（全量 sha256 + file_id 预分配）")
+    parser = argparse.ArgumentParser(
+        description="knowledge-vault 入库（默认原地登记 Obsidian 真源；--source 指向副本/快照则走落位模式）"
+    )
+    for p in (sub := parser.add_subparsers(dest="command", required=True)).choices.values():
+        p.add_argument("--source", default=None, metavar="PATH",
+                       help="入库源根目录（默认 ~/Documents/obsidian_file）")
+        p.add_argument("--vault-root", default=None, metavar="PATH",
+                       help="目标区根目录（默认 ~/Documents/knowledge-vault_file；--in-place 时忽略）")
+        p.add_argument("--in-place", action="store_true",
+                       help="原地登记：零拷贝、绝不写源文件（frontmatter 改写强制关闭）")
+        p.add_argument("--no-fm-write", action="store_true",
+                       help="跳过 frontmatter 改写（登记信息只进索引层）")
+        p.add_argument("--exclude-dir", action="append", default=None, metavar="RELPATH",
+                       help="用户级排除目录（相对源根，可重复）；另读 KV_EXCLUDE_DIRS（逗号分隔）")
     p_gen.add_argument("--regenerate", action="store_true")
     p_run = sub.add_parser("run", help="执行批次（默认 B0→B7 全量 + 收尾）")
     p_run.add_argument("--only", choices=BATCH_ORDER, default=None)
@@ -1352,6 +1399,26 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="manifest 状态速览")
     sub.add_parser("report", help="基于 manifest + 库的汇总报告")
     args = parser.parse_args(argv)
+
+    # CLI 参数 → 运行模式全局覆盖（须在调度前完成）
+    global SNAPSHOT_ROOT, VAULT_ROOT, IN_PLACE, FM_WRITE, USER_EXCLUDE_RELPATHS
+    if args.source:
+        SNAPSHOT_ROOT = Path(args.source).expanduser()
+    if args.vault_root:
+        VAULT_ROOT = Path(args.vault_root).expanduser()
+    IN_PLACE = bool(args.in_place)
+    FM_WRITE = (not IN_PLACE) and (not args.no_fm_write)
+    if IN_PLACE:
+        VAULT_ROOT = SNAPSHOT_ROOT  # 原地登记：目标区即源区
+    USER_EXCLUDE_RELPATHS = {p.strip().strip("/") for p in (args.exclude_dir or []) if p.strip()}
+    for part in os.environ.get("KV_EXCLUDE_DIRS", "").split(","):
+        if part.strip():
+            USER_EXCLUDE_RELPATHS.add(part.strip().strip("/"))
+    log.info(
+        "模式: %s | 源: %s | 目标: %s | fm_write=%s | 用户排除: %s",
+        "in-place" if IN_PLACE else "copy-to-vault", SNAPSHOT_ROOT, VAULT_ROOT,
+        FM_WRITE, sorted(USER_EXCLUDE_RELPATHS) or "无",
+    )
 
     t0 = time.time()
     if args.command == "generate":

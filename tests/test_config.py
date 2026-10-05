@@ -10,6 +10,7 @@ import pytest
 from knowledge_vault import Store
 from knowledge_vault.config import (
     DEFAULT_FILE_ID_SEED,
+    ENV_EXCLUDE_DIRS,
     ENV_FILE_ID_SEED,
     ENV_STATE_DIR,
     ENV_USERDICT,
@@ -25,9 +26,13 @@ class TestDefaults:
         assert cfg.state_dir == Path(
             "~/llwwds_application/knowledge-vault/state"
         ).expanduser()
-        assert cfg.vault_root == Path("~/Documents/knowledge-vault_file").expanduser()
+        # 单真源：默认指向用户 Obsidian 仓库原位置（系统对其零写入）
+        assert cfg.vault_root == Path("~/Documents/obsidian_file").expanduser()
         assert "~" not in str(cfg.state_dir)
         assert "~" not in str(cfg.vault_root)
+
+    def test_default_exclude_dirs_empty(self):
+        assert load_config(env={}).exclude_dirs == ()
 
     def test_default_seed(self):
         assert load_config(env={}).file_id_seed == DEFAULT_FILE_ID_SEED == 1
@@ -63,6 +68,14 @@ class TestEnvInjection:
     def test_paths_expanduser_from_env(self):
         cfg = load_config(env={ENV_STATE_DIR: "~/kv-state-x"})
         assert cfg.state_dir == Path("~/kv-state-x").expanduser()
+
+    def test_exclude_dirs_parsing(self):
+        env = {ENV_EXCLUDE_DIRS: " 99 废纸篓 , /02 项目/0212 公司项目/ ,,x/"}
+        cfg = load_config(env=env)
+        assert cfg.exclude_dirs == ("99 废纸篓", "02 项目/0212 公司项目", "x")
+
+    def test_exclude_dirs_unset_is_empty(self):
+        assert load_config(env={ENV_VAULT_ROOT: "/tmp/v"}).exclude_dirs == ()
 
     def test_userdict_empty_string_disables(self):
         assert load_config(env={ENV_USERDICT: ""}).userdict_path is None
