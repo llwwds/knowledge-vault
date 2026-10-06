@@ -78,7 +78,7 @@ from knowledge_vault.vectorstore import ZvecStore
 
 #: 入库源根（默认 = 用户 Obsidian 仓库原位置，单真源）。--source 可覆盖
 #: （如指向历史快照做副本区落位）；一律用 ~ 形态，不写入个人绝对路径。
-SNAPSHOT_ROOT = Path("~/Documents/obsidian_file")
+SNAPSHOT_ROOT = Path("~/Documents/obsidian_file").expanduser()
 
 #: 目标区根：--in-place（原地登记）时 = SNAPSHOT_ROOT（零拷贝、零写入 vault）；
 #: 否则为副本区（历史快照落位模式）。
@@ -1310,6 +1310,7 @@ def cmd_run(only: str | None, batches: str | None, *, embed_devices: str = "cpu"
             embed_batch_texts: int = 64, prune_target: bool = False) -> None:
     ctx = Ctx(embed_devices=embed_devices, embed_threads=embed_threads,
               embed_batch=embed_batch, embed_batch_texts=embed_batch_texts)
+    ctx.prune_target = prune_target
     ctx.manifest = load_manifest()
 
     def _handle_stop(signum, frame):  # noqa: ANN001
