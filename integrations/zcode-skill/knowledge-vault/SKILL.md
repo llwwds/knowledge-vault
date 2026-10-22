@@ -1,6 +1,6 @@
 ---
 name: knowledge-vault
-description: Search the user's personal knowledge base (knowledge-vault: ~50k registered files — notes, project docs, work records, credentials, university files) with hybrid recall (FTS + vector + graph, optional rerank). Use when the user asks to find or look up their own notes, documents, past work, decisions, or personal knowledge; also use to ground answers in the user's own material before responding. Read-only plus index-optimize; writes happen only via the user's Obsidian editing.
+description: "Search the user's personal knowledge base (knowledge-vault: ~50k registered files — notes, project docs, work records, credentials, university files) with hybrid recall (FTS + vector + graph, optional rerank). Use when the user asks to find or look up their own notes, documents, past work, decisions, or personal knowledge; also use to ground answers in the user's own material before responding. Read-only plus index-optimize; writes happen only via the user's Obsidian editing."
 ---
 
 # knowledge-vault — personal knowledge base search
