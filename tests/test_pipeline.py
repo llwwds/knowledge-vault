@@ -124,9 +124,43 @@ def test_fts_only_ingest_skips_embedding_and_vector_state(store, state, tmp_path
     assert vectors.upserts == 0
     assert not (store.config.state_dir / "zvec_chunks").exists()
     hits = store.search("genuine full-text retrieval")
-    assert hits and hits[0].file_path.endswith("fts-only.md")
+    assert hits and "genuine full-text retrieval" in hits[0].text  # ChunkHit 无 file_path，按 file_id 定位
+    assert store.get_file(hits[0].file_id).file_path.endswith("fts-only.md")
     task = state.get_task(str(path))
     assert task is not None and task.state == "indexed" and task.embedded_at is None
+
+
+def test_repeated_modification_does_not_duplicate_chunks(
+    pipe, store, vectors, state, tmp_path
+):
+    """幂等回归：同一文件连改两次，chunks 不得翻倍（先清后写）。"""
+
+    def chunk_seqs(file_id: int) -> list[int]:
+        return [
+            int(row[0])
+            for row in store.conn.execute(
+                "SELECT chunk_seq FROM chunks WHERE file_id = ? ORDER BY chunk_seq",
+                (file_id,),
+            )
+        ]
+
+    path = tmp_path / "twice.md"
+    path.write_text("# 头\n\n第一版 token_one。\n", encoding="utf-8")
+    assert pipe.process_file(path) == "indexed"
+    file_id = state.get_task(str(path)).file_id
+    seqs_after_first = chunk_seqs(file_id)
+    assert seqs_after_first
+
+    for body in ("第二版 token_two。", "第三版 token_three，正文再长一些。"):
+        path.write_text(f"# 头\n\n{body}\n", encoding="utf-8")
+        assert pipe.process_file(path) == "indexed"
+        # 不翻倍：seq 仍是 1..N 连续，无重复行；向量侧与 FTS 侧数量一致
+        assert chunk_seqs(file_id) == seqs_after_first
+        assert vectors.count() == len(seqs_after_first)
+
+    # 旧内容必须已经从两侧消失
+    assert store.search("token_one") == []
+    assert any("token_three" in hit.text for hit in store.search("token_three"))
 
 
 def test_process_unchanged_skips(pipe, store, vectors, state, tmp_path):

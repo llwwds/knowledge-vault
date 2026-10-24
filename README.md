@@ -50,7 +50,15 @@ src/knowledge_vault/
 tests/              # pytest 全套（合成数据 + tmp_path 隔离，不读真实 vault/快照）
 ```
 
-运行时配置（环境变量，均可在启动时注入）：`KV_STATE_DIR`（默认 `~/llwwds_application/knowledge-vault/state`）、`KV_VAULT_ROOT`（默认 `~/Documents/knowledge-vault_file`）、`KV_USERDICT`（默认包内 `data/userdict.txt`，置空禁用）、`KV_FILE_ID_SEED`（默认 1）。
+运行时配置（环境变量，均可在启动时注入）：`KV_STATE_DIR`（默认 `~/llwwds_application/knowledge-vault/state`）、`KV_VAULT_ROOT`（默认 `~/Documents/knowledge-vault_file`）、`KV_USERDICT`（默认包内 `data/userdict.txt`，置空禁用）、`KV_FILE_ID_SEED`（默认 1）、`KV_WRITABLE_ROOT`（受控写 API 的笔记目录）、`KV_FTS_ONLY`（只建全文索引，不开向量库）、`KV_WATCH`（`kv-serve` 内嵌 vault 监听）、`KV_WATCH_INTERVAL`（监听轮询间隔秒，默认 30）。
+
+## 实时同步（watcher）
+
+真源永远是 Obsidian vault，索引只是派生副本，因此 vault 一旦变更就要立刻反映到检索结果：
+
+- `kv-watch`：轮询 vault 变更（创建/修改/删除/移动）并自动摄入，阻塞运行；`--interval` 指定间隔秒（默认取 `KV_WATCH_INTERVAL`，兜底 30）；`--once` 只做一轮全量对账后退出（现存文件摄入 + 已消失文件软删），供测试与手动对账。
+- `KV_WATCH=1 kv-serve`：在 API 进程内起监听守护线程，单轮异常只记日志、线程不退出；进程退出线程随之结束。
+- 受控写 API 的笔记目录（`KV_WRITABLE_ROOT`）整棵子树被排除：其变更已由 API 写入时自带的摄入管线处理，重复摄入会竞态并产生重复 chunk。该目录在部署上是 vault 内部子目录的挂载点（路径前缀不可靠），watcher 按目录 inode 身份排除。
 
 ## Web 看板
 

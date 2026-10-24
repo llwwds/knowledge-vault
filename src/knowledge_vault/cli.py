@@ -6,10 +6,13 @@
   [--no-rerank] [--no-graph]``：召回并按行输出 JSONL（每条结果一行 JSON）；
   rerank 默认开启（真实 FlagRerankerImpl，惰性加载），``--no-rerank`` 关闭。
 - ``kv-serve [--host H] [--port P]``：阻塞式 HTTP API（见 api.py）。
+- ``kv-watch [--interval S] [--once]``：轮询 vault 变更并实时摄入（阻塞）；
+  ``--interval`` 缺省取 ``KV_WATCH_INTERVAL``（兜底 30s），``--once`` 只做一轮
+  全量对账后退出（现存文件摄入 + 消失文件软删）。
 - ``kv-optimize``：触发 FTS/SQLite/zvec 索引优化，输出 JSON 摘要。
 - ``kv-stats``：输出只读运行统计 JSON。
 
-写入不经 CLI/API——写入只走摄入管线；本壳只做读 + optimize 触发。
+写入不经 CLI/API——写入只走摄入管线；本壳只做读 + optimize 触发 + vault 监听。
 
 入口约定：``main(argv) -> int``（进程退出码）。console_scripts 入口
 ``kv = knowledge_vault.cli:main`` 已在 pyproject 注册。测试可用 ``config`` /
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from typing import Sequence
 
@@ -40,6 +44,7 @@ from .registry import STATUSES
 from .rerank import FlagRerankerImpl
 from .retrieve import VectorPath, retrieve
 from .store import Store
+from .watcher import DEFAULT_WATCH_INTERVAL, WatcherService
 
 __all__ = ["build_parser", "main"]
 
@@ -75,6 +80,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("kv-serve", help="启动 HTTP API 服务（阻塞）")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=None, help=f"默认取 KV_API_PORT 或 {DEFAULT_API_PORT}")
+
+    p_watch = sub.add_parser("kv-watch", help="轮询 vault 变更并实时摄入（阻塞）")
+    p_watch.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help=f"轮询间隔秒；默认取 KV_WATCH_INTERVAL 或 {DEFAULT_WATCH_INTERVAL:g}",
+    )
+    p_watch.add_argument(
+        "--once",
+        action="store_true",
+        help="只做一轮全量对账后退出（现存文件摄入 + 消失文件软删；测试/手动对账）",
+    )
 
     sub.add_parser("kv-optimize", help="触发 FTS/SQLite/zvec 索引优化")
     sub.add_parser("kv-stats", help="输出运行统计 JSON")
@@ -147,11 +165,28 @@ def _cmd_search(args: argparse.Namespace, *, config: VaultConfig, injected: dict
 
 
 def _cmd_serve(args: argparse.Namespace, *, config: VaultConfig, injected: dict) -> int:
+    _setup_logging()
     serve(
         config,
         host=args.host,
         port=args.port,
         reranker=injected.get("reranker"),
+    )
+    return 0
+
+
+def _cmd_watch(args: argparse.Namespace, *, config: VaultConfig) -> int:
+    _setup_logging()
+    service = WatcherService(config, interval=args.interval)
+    try:
+        events = service.run(once=args.once)
+    finally:
+        service.close()
+    print(
+        json.dumps(
+            {"once": args.once, "interval": service.interval, "events": events},
+            ensure_ascii=False,
+        )
     )
     return 0
 
@@ -164,6 +199,14 @@ def _cmd_optimize(*, config: VaultConfig) -> int:
 def _cmd_stats(*, config: VaultConfig) -> int:
     print(json.dumps(collect_stats(config), ensure_ascii=False, indent=2))
     return 0
+
+
+def _setup_logging() -> None:
+    """CLI 入口日志口径（已配置过（如外层或测试）则不覆盖）。"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 def main(
@@ -184,6 +227,8 @@ def main(
             return _cmd_search(args, config=cfg, injected=injected)
         if args.command == "kv-serve":
             return _cmd_serve(args, config=cfg, injected=injected)
+        if args.command == "kv-watch":
+            return _cmd_watch(args, config=cfg)
         if args.command == "kv-optimize":
             return _cmd_optimize(config=cfg)
         if args.command == "kv-stats":

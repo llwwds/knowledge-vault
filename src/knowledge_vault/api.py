@@ -30,14 +30,18 @@
 - ``GET  /ui/theme.css``    → 皮肤 CSS（``?name=<name>``；未知名字回退默认）。
 
 并发模型：``ThreadingHTTPServer`` + **每请求独立 SQLite 连接**（WAL 允许多读
-并发，连接不跨线程复用）；写操作（optimize）由进程内互斥锁串行化——单线程化
-写保护。端口取 ``KV_API_PORT``（默认 8770）。
+并发，连接不跨线程复用）；写操作（optimize / 受控笔记 CRUD）由进程内互斥锁
+串行化——单线程化写保护。端口取 ``KV_API_PORT``（默认 8770）。
+
+``KV_WATCH=1`` 时 :func:`serve` 额外启动 vault 监听守护线程（见
+:class:`~knowledge_vault.watcher.WatcherService`），受控写入目录整棵子树被排除。
 """
 
 from __future__ import annotations
 
-import json
 import hmac
+import json
+import logging
 import os
 import re
 import threading
@@ -51,15 +55,15 @@ import zvec
 from zvec import HnswQueryParam
 
 from . import __version__, webui
-from .config import VaultConfig, load_config
+from .config import VaultConfig, env_flag, load_config, writable_root
 from .embedder import BGEM3Embedder, OllamaEmbedder
 from .protocols import Reranker
 from .registry import get_file
 from .retrieve import RetrievalOutput, ZvecVectorIndex, retrieve
 from .rerank import FlagRerankerImpl
+from .pipeline import PipelineHandles, fts_only_enabled, open_pipeline
 from .store import Store
-from .pipeline import IngestPipeline, PipelineState
-from .vectorstore import ZvecStore
+from .watcher import WatcherService
 
 __all__ = [
     "DEFAULT_API_PORT",
@@ -69,6 +73,8 @@ __all__ = [
     "run_optimize",
     "collect_stats",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def open_vector_path(config: VaultConfig) -> tuple[ZvecVectorIndex | None, "zvec.Collection | None"]:
@@ -88,36 +94,10 @@ def open_vector_path(config: VaultConfig) -> tuple[ZvecVectorIndex | None, "zvec
 DEFAULT_API_PORT = 8770
 ENV_API_PORT = "KV_API_PORT"
 ENV_EMBEDDER = "KV_EMBEDDER"
-ENV_FTS_ONLY = "KV_FTS_ONLY"
+ENV_WATCH = "KV_WATCH"
 
 #: optimize 等写操作的进程内互斥锁（单线程化写保护）
 _WRITE_LOCK = threading.Lock()
-
-
-class _NoVectorIndex:
-    """No-op adapter for FTS-only mode; it must never create fake vectors."""
-
-    def attach_optimize_state(self, _state) -> None:
-        return None
-
-    def delete_file(self, _file_id: int) -> None:
-        return None
-
-    def upsert_chunks(self, _file_id: int, _seqs, _vectors, _kinds) -> None:
-        return None
-
-    def optimize_if_needed(self, _state, *, every: int, hours: float) -> bool:
-        return False
-
-    def optimize(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-
-def _fts_only_enabled() -> bool:
-    return os.environ.get(ENV_FTS_ONLY, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _utc_now() -> str:
@@ -526,28 +506,10 @@ class _ApiHandler(BaseHTTPRequestHandler):
             raise ValueError("title 不能超过 120 个字符")
         return body, safe_title, content
 
-    def _new_pipeline(self):
-        """构造本次写操作的 pipeline；调用方需在 finally 中关闭全部句柄。"""
-        store = _open_store(self.config)
-        state = PipelineState(self.config.state_dir / "pipeline.sqlite3")
-        if _fts_only_enabled():
-            vectors = _NoVectorIndex()
-            pipeline_embedder = None
-        else:
-            vec_dir = self.config.state_dir / "zvec_chunks"
-            if (vec_dir / "meta.json").is_file():
-                vectors = ZvecStore.open(vec_dir, optimize_state=state)
-            else:
-                vectors = ZvecStore.create(vec_dir, optimize_state=state)
-            pipeline_embedder = self.embedder
-        return IngestPipeline(store, vectors, state, embedder=pipeline_embedder), store, vectors, state
-
-    @staticmethod
-    def _close_pipeline(handles) -> None:
-        _, store, vectors, state = handles
-        vectors.close()
-        state.close()
-        store.close()
+    def _new_pipeline(self) -> PipelineHandles:
+        """本次写操作的摄入栈（与 watcher 共用 :func:`open_pipeline` 装配）；
+        调用方需在 finally 中 ``handles.close()``。"""
+        return open_pipeline(self.config, embedder=self.embedder)
 
     def _managed_doc(self, file_id: int):
         store = _open_store(self.config)
@@ -585,9 +547,9 @@ class _ApiHandler(BaseHTTPRequestHandler):
             os.chmod(path, 0o600)
             handles = self._new_pipeline()
             try:
-                result = handles[0].process_file(path)
+                result = handles.pipeline.process_file(path)
             finally:
-                self._close_pipeline(handles)
+                handles.close()
         if result not in {"indexed", "skipped"}:
             self._send_json(503, {"error": f"摄入失败: {result}", "file_id": doc.file_id})
             return
@@ -660,9 +622,9 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 try:
                     handles = self._new_pipeline()
                     try:
-                        result = handles[0].process_file(note_path)
+                        result = handles.pipeline.process_file(note_path)
                     finally:
-                        self._close_pipeline(handles)
+                        handles.close()
                 except Exception as exc:  # 恢复原文并重建原索引
                     ingest_error = type(exc).__name__
             finally:
@@ -678,9 +640,9 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 with _WRITE_LOCK:
                     handles = self._new_pipeline()
                     try:
-                        rollback_result = handles[0].process_file(note_path)
+                        rollback_result = handles.pipeline.process_file(note_path)
                     finally:
-                        self._close_pipeline(handles)
+                        handles.close()
             except Exception as exc:  # noqa: BLE001
                 rollback_error = type(exc).__name__
                 rollback_result = "failed"
@@ -708,9 +670,9 @@ class _ApiHandler(BaseHTTPRequestHandler):
         with _WRITE_LOCK:
             handles = self._new_pipeline()
             try:
-                result = handles[0].handle_deleted(note_path)
+                result = handles.pipeline.handle_deleted(note_path)
             finally:
-                self._close_pipeline(handles)
+                handles.close()
         updated, _ = self._managed_doc(file_id)
         self._send_json(
             200,
@@ -846,7 +808,7 @@ def make_server(
     handler.reranker = reranker
     if embedder is not None:
         handler.embedder = embedder
-    elif _fts_only_enabled():
+    elif fts_only_enabled():
         handler.embedder = None
     elif os.environ.get(ENV_EMBEDDER, "").lower() == "ollama":
         handler.embedder = OllamaEmbedder(
@@ -869,6 +831,8 @@ def serve(
 
     ``port=None`` 时取 ``KV_API_PORT``（默认 8770）；``reranker`` 缺省为
     ``FlagRerankerImpl()``（惰性加载，首次查询才加载模型）。
+    ``KV_WATCH=1`` 时额外起 vault 监听守护线程（受控写入目录整棵子树排除）；
+    监听启动失败只记日志，不影响 API 本体的可用性。
     """
     config = config or load_config()
     if port is None:
@@ -878,9 +842,30 @@ def serve(
     )
     host_bound, port_bound = server.server_address[:2]
     print(f"knowledge-vault api listening on {host_bound}:{port_bound}", flush=True)
+    watcher = _start_watcher(config) if env_flag(ENV_WATCH) else None
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if watcher is not None:
+            watcher.stop()
         server.server_close()
+
+
+def _start_watcher(config: VaultConfig) -> WatcherService | None:
+    """起内嵌 vault 监听守护线程（``KV_WATCH=1``）。
+
+    构造/启动失败只记日志并返回 ``None``：监听掉线不能连带把检索 API 拉下。
+    """
+    try:
+        service = WatcherService(config)
+        service.start()
+    except Exception:  # noqa: BLE001 - 监听是旁路，不阻断 API 主路
+        logger.exception("vault 监听启动失败，API 继续运行（本进程不实时同步）")
+        return None
+    print(
+        f"knowledge-vault watcher polling {config.vault_root} every {service.interval:g}s",
+        flush=True,
+    )
+    return service

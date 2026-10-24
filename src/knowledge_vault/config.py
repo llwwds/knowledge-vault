@@ -13,6 +13,8 @@
 - ``KV_USERDICT``      jieba 用户词典路径（默认取包内打包的 ``data/userdict.txt``；
                        置为空字符串表示不加载任何用户词典）
 - ``KV_FILE_ID_SEED``  file_id 分配器起始种子（默认 1；批量导入时可抬高起点）
+- ``KV_WRITABLE_ROOT``  受控写 API 的笔记目录（与 ``KV_VAULT_ROOT`` 内的实际
+                       落位同一份内容，见 :func:`writable_root`）
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ ENV_VAULT_ROOT = "KV_VAULT_ROOT"
 ENV_EXCLUDE_DIRS = "KV_EXCLUDE_DIRS"
 ENV_USERDICT = "KV_USERDICT"
 ENV_FILE_ID_SEED = "KV_FILE_ID_SEED"
+ENV_WRITABLE_ROOT = "KV_WRITABLE_ROOT"
 
 DEFAULT_STATE_DIR = "~/llwwds_application/knowledge-vault/state"
 DEFAULT_VAULT_ROOT = "~/Documents/knowledge-vault_file"
@@ -60,6 +63,30 @@ class VaultConfig:
     def db_path(self) -> Path:
         """登记层 SQLite 数据库文件路径（位于 state_dir 下）。"""
         return self.state_dir / "kv.sqlite3"
+
+
+def env_flag(name: str, env: Mapping[str, str] | None = None) -> bool:
+    """布尔型环境变量口径：``1/true/yes/on``（大小写无关）为真，其余为假。"""
+    raw = (os.environ if env is None else env).get(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def writable_root(
+    env: Mapping[str, str] | None = None, *, create: bool = False
+) -> Path | None:
+    """``KV_WRITABLE_ROOT``：受控写 API 的笔记目录（未配置返回 ``None``）。
+
+    该目录在部署上是 vault 内部某个子目录的挂载点（容器里是
+    ``/managed-notes`` ↔ ``/obsidian-vault/00 收集箱/...``），所以调用方
+    不能靠路径前缀判断「是否在 vault 内」——watcher 用目录 inode 身份排除。
+    """
+    raw = (os.environ if env is None else env).get(ENV_WRITABLE_ROOT)
+    if not raw:
+        return None
+    root = Path(raw).expanduser().resolve()
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def load_config(env: Mapping[str, str] | None = None) -> VaultConfig:

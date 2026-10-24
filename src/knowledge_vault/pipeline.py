@@ -40,7 +40,8 @@ from .chunker import (
     chunk_markdown,
     chunk_plain,
 )
-from .embedder import Embedder
+from .config import VaultConfig, env_flag
+from .embedder import BGEM3Embedder, Embedder
 from .registry import Document, UnknownFileIdError, compute_content_hash, utc_iso
 from .store import Store
 from .vectorstore import (
@@ -53,14 +54,22 @@ from .vectorstore import (
 __all__ = [
     "IngestPipeline",
     "IngestParams",
+    "NoVectorStore",
+    "PipelineHandles",
     "PipelineState",
     "ProcessReport",
     "Task",
+    "open_pipeline",
+    "fts_only_enabled",
     "LARGE_FILE_THRESHOLD_BYTES",
     "TASK_STATES",
+    "ENV_FTS_ONLY",
     "ENV_OPTIMIZE_EVERY",
     "ENV_OPTIMIZE_HOURS",
 ]
+
+#: FTS-only 模式开关（容器默认部署口径：不开向量库、不调 embedding）
+ENV_FTS_ONLY = "KV_FTS_ONLY"
 
 #: 管线级 optimize 阈值环境变量（KV_OPTIMIZE_EVERY 条 / KV_OPTIMIZE_HOURS 小时）
 ENV_OPTIMIZE_EVERY = "KV_OPTIMIZE_EVERY"
@@ -684,3 +693,89 @@ class IngestPipeline:
 def _read_text(path: Path) -> str:
     """读文本（UTF-8，非法字节替换而非失败——真源区允许个别脏文件）。"""
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+# --------------------------------------------------------------- 组合根
+
+
+def fts_only_enabled(env=None) -> bool:
+    """FTS-only 模式是否开启（``KV_FTS_ONLY``）。"""
+    return env_flag(ENV_FTS_ONLY, env)
+
+
+class NoVectorStore:
+    """FTS-only 模式的空向量库适配器（接口对齐 :class:`ZvecStore`，全部 no-op）。
+
+    关键约定：**绝不生成伪向量**，也不创建 ``state/zvec_chunks`` 目录；
+    摄入管线因此只写 FTS（``IngestPipeline.embedder=None``）。
+    """
+
+    def attach_optimize_state(self, _state) -> None:
+        return None
+
+    def delete_file(self, _file_id: int) -> None:
+        return None
+
+    def upsert_chunks(self, _file_id: int, _seqs, _vectors, _kinds) -> None:
+        return None
+
+    def optimize_if_needed(self, _state, *, every: int, hours: float) -> bool:
+        return False
+
+    def optimize(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+@dataclass
+class PipelineHandles:
+    """一次摄入栈装配的全部句柄；关闭顺序：向量 → pipeline.db → 登记库。"""
+
+    pipeline: IngestPipeline
+    store: Store
+    state: PipelineState
+    vectors: object
+
+    def close(self) -> None:
+        self.vectors.close()
+        self.state.close()
+        self.store.close()
+
+
+def open_pipeline(
+    config: VaultConfig,
+    *,
+    embedder: Embedder | None = None,
+    fts_only: bool | None = None,
+) -> PipelineHandles:
+    """装配摄入栈（API 写操作、watcher、批量脚本共用的唯一装配点）。
+
+    - ``fts_only`` 缺省读 ``KV_FTS_ONLY``；为真时用 :class:`NoVectorStore`
+      且强制 ``embedder=None``（只写 FTS，不落伪向量，不建 zvec 目录）。
+    - 非 FTS-only：``state/zvec_chunks`` 已存在则打开、不存在则新建；
+      ``embedder`` 缺省为 :class:`BGEM3Embedder`（惰性，首次 encode 才加载模型）。
+    """
+    fts_only = fts_only_enabled() if fts_only is None else fts_only
+    store = Store(config=config)
+    state: PipelineState | None = None
+    try:
+        state = PipelineState(config.state_dir / DEFAULT_PIPELINE_DB_FILENAME)
+        if fts_only:
+            vectors: object = NoVectorStore()
+            pipeline_embedder: Embedder | None = None
+        else:
+            vec_dir = config.state_dir / DEFAULT_ZVEC_DIRNAME
+            if (vec_dir / "meta.json").is_file():
+                vectors = ZvecStore.open(vec_dir, optimize_state=state)
+            else:
+                vectors = ZvecStore.create(vec_dir, optimize_state=state)
+            pipeline_embedder = embedder if embedder is not None else BGEM3Embedder()
+    except BaseException:
+        if state is not None:
+            state.close()
+        store.close()
+        raise
+    pipeline = IngestPipeline(store, vectors, state, embedder=pipeline_embedder)
+    return PipelineHandles(pipeline=pipeline, store=store, state=state, vectors=vectors)

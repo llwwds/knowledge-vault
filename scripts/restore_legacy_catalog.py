@@ -20,7 +20,7 @@ from typing import Any
 
 from knowledge_vault.chunker import MARKDOWN_EXTENSIONS, TEXT_EXTENSIONS
 from knowledge_vault.config import load_config
-from knowledge_vault.pipeline import IngestPipeline, PipelineState
+from knowledge_vault.pipeline import IngestPipeline, NoVectorStore, PipelineState
 from knowledge_vault.registry import Document, get_file
 from knowledge_vault.store import Store
 
@@ -33,28 +33,6 @@ SNAPSHOT_ID = "2026-09-06-legacy-document-catalog"
 NAMESPACE = "knowledge-vault-legacy-catalog-v1"
 REPORT_PATH = STATE_DIR / "legacy-restore-report.json"
 BATCH_SIZE = int(os.environ.get("KV_LEGACY_BATCH_SIZE", "25"))
-
-
-class NoVectorIndex:
-    """Pipeline adapter that preserves FTS/index state without embedding calls."""
-
-    def attach_optimize_state(self, _state):
-        return None
-
-    def delete_file(self, _file_id: int):
-        return None
-
-    def upsert_chunks(self, _file_id: int, _seqs, _vectors, _kinds):
-        return None
-
-    def optimize_if_needed(self, _state, *, every: int, hours: float) -> bool:
-        return False
-
-    def optimize(self):
-        return None
-
-    def close(self):
-        return None
 
 
 def _safe_relpath(value: Any) -> str | None:
@@ -195,7 +173,7 @@ def main() -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     store = Store(config=config)
     state = PipelineState(STATE_DIR / "pipeline.sqlite3")
-    vectors = NoVectorIndex()
+    vectors = NoVectorStore()
     pipeline = IngestPipeline(store, vectors, state, embedder=None)
     counters: Counter[str] = Counter()
     started = time.time()

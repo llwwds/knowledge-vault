@@ -316,8 +316,9 @@ class TestLegacyRoutesRegression:
         assert body["title"] == "机器学习笔记"
         status, _ = _get_json(f"{base}/files/99999")
         assert status == 404
+        # 非法 ID 与不存在的 ID 同为 404（非数字 ID 只是无法解析为 legacy 别名）
         status, _ = _get_json(f"{base}/files/abc")
-        assert status == 400
+        assert status == 404
 
     def test_search_regression(self, api_factory, kb):
         base = api_factory()

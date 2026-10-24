@@ -12,6 +12,7 @@ from typing import Callable
 import pytest
 
 from knowledge_vault import api
+from knowledge_vault import pipeline as pipeline_module
 from knowledge_vault.embedder import FakeEmbedder
 
 from _phase3_helpers import FakeRerankerByLength, build_kb
@@ -232,7 +233,8 @@ class TestFilesEndpoint:
         assert body["context_tag"] == ["ml", "ai"]
         assert body["status"] == "now"
 
-    def test_get_legacy_alias_is_read_only(self, api_factory, kb, store):
+    def test_get_legacy_alias_is_read_only(self, api_factory, kb, store, monkeypatch):
+        monkeypatch.setenv("KV_WRITE_TOKEN", "test-token")
         store.conn.execute(
             """CREATE TABLE legacy_id_alias (
                 namespace TEXT NOT NULL, snapshot_id TEXT NOT NULL,
@@ -257,6 +259,7 @@ class TestFilesEndpoint:
         assert status == 200
         assert body["read_only"] is True
         assert "content" not in body
+        # 写入端点只接受整数 runtime ID：legacy 字符串 ID 直接拒绝（不授予任何写入）
         write_status, _ = _method(
             f"{base}/documents/kvf_test_123", "PUT", {"content": "must not update"},
             headers={"Authorization": "Bearer test-token"},
@@ -275,9 +278,10 @@ class TestFilesEndpoint:
         assert status == 404
 
     def test_get_file_bad_id(self, api_factory, kb):
+        # 非数字 ID 也不是可解析的 legacy 别名 → 404（与 /files/999999 同语义）
         base = api_factory()
         status, _ = _get(f"{base}/files/abc")
-        assert status == 400
+        assert status == 404
 
 
 class TestControlledDocumentCrud:
@@ -369,7 +373,7 @@ class TestControlledDocumentCrud:
         source = Path(created["file_path"])
         original_note = created["content"]
 
-        process_file = api.IngestPipeline.process_file
+        process_file = pipeline_module.IngestPipeline.process_file
         calls = 0
 
         def fail_once(pipeline, path):
@@ -379,18 +383,31 @@ class TestControlledDocumentCrud:
                 raise RuntimeError("injected index failure")
             return process_file(pipeline, path)
 
-        monkeypatch.setattr(api.IngestPipeline, "process_file", fail_once)
+        monkeypatch.setattr(pipeline_module.IngestPipeline, "process_file", fail_once)
         status, body = _method(
             f"{base}/documents/{file_id}", "PUT",
             {"content": "# 回滚验收笔记\n\n新内容：琥珀海湾。"}, headers=auth,
         )
         assert status == 503, body
         assert body["source_restored"] is True
-        assert body["rollback_ingest"] == "indexed"
+        # 回滚重建的结果是 indexed 或 skipped：失败尝试未弄脏索引时内容哈希已对齐，
+        # 管线按断点续传跳过——两者都表示"旧内容在索引里仍是权威状态"。
+        assert body["rollback_ingest"] in {"indexed", "skipped"}
         assert source.read_text(encoding="utf-8") == original_note
         status, read_back = _get(f"{base}/documents/{file_id}")
         assert status == 200
         assert read_back["content"] == original_note
+        # 索引侧同样回到旧内容：chunk 原文就是权威索引内容（向量路命中也是回表取它），
+        # 必须仍是旧正文，被拒的新正文一个字都不能进库。
+        # 注意不能按 file_id 断言：FakeEmbedder 的查询向量与文档向量无相关性，
+        # 单文档库里任何查询都会被 vector 路噪声式命中（但 text 仍是旧正文，
+        # 即索引未污染）；真正没回滚时 text 会是新正文，下面两条会失败。
+        status, result = _post(f"{base}/search", {"query": "银色山谷"})
+        assert status == 200
+        assert any("银色山谷" in item["text"] for item in result["items"])
+        status, result = _post(f"{base}/search", {"query": "琥珀海湾"})
+        assert status == 200
+        assert all("琥珀海湾" not in item["text"] for item in result["items"])
 
 
 class TestOptimizeEndpoint:
