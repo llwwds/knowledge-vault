@@ -33,8 +33,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
-
 from .chunker import (
     MARKDOWN_EXTENSIONS,
     TEXT_EXTENSIONS,
@@ -430,7 +428,7 @@ class IngestPipeline:
         vectors: ZvecStore,
         state: PipelineState,
         *,
-        embedder: Embedder,
+        embedder: Embedder | None,
         params: IngestParams | None = None,
     ) -> None:
         self.store = store
@@ -490,7 +488,7 @@ class IngestPipeline:
                 path_str, "parsed", content_hash=content_hash, file_id=file_id
             )
 
-            # ---- embedding（embedded）
+            # ---- embedding（可选；FTS-only 模式不生成伪向量）
             texts: list[str] = []
             seqs: list[int] = []
             kinds: list[str] = []
@@ -502,11 +500,11 @@ class IngestPipeline:
                 texts.append(chunk.text)
                 seqs.append(chunk.seq)
                 kinds.append("chunk")
-            if texts:
+            if texts and self.embedder is not None:
                 vecs = self.embedder.encode(texts)
+                self.state.set_task_state(path_str, "embedded")
             else:
-                vecs = np.zeros((0, self.embedder.dim), dtype=np.float32)
-            self.state.set_task_state(path_str, "embedded")
+                vecs = None
 
             # ---- 双写（indexed）：先 FTS 后向量（两侧以 chunk_seq 对齐）。
             # 向量侧必须用 upsert：上面的 delete_by_filter 会留下墓碑
@@ -518,7 +516,7 @@ class IngestPipeline:
                 )
             if doc.summary:
                 self.store.add_summary_chunk(file_id, doc.summary)
-            if seqs:
+            if seqs and vecs is not None:
                 self.vectors.upsert_chunks(file_id, seqs, vecs, kinds)
             self.state.set_task_state(
                 path_str, "indexed", error=None,

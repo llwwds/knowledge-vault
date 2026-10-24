@@ -95,6 +95,40 @@ def test_process_new_md_indexed(pipe, store, vectors, state, tmp_path):
     assert vectors.count() == fts_count
 
 
+def test_fts_only_ingest_skips_embedding_and_vector_state(store, state, tmp_path):
+    class NoVectors:
+        def __init__(self):
+            self.upserts = 0
+
+        def attach_optimize_state(self, _state):
+            pass
+
+        def delete_file(self, _file_id):
+            pass
+
+        def upsert_chunks(self, *_args):
+            self.upserts += 1
+
+        def optimize_if_needed(self, *_args, **_kwargs):
+            return False
+
+        def close(self):
+            pass
+
+    vectors = NoVectors()
+    pipeline = IngestPipeline(store, vectors, state, embedder=None)
+    path = tmp_path / "fts-only.md"
+    path.write_text("# FTS only\n\nA genuine full-text retrieval phrase.", encoding="utf-8")
+
+    assert pipeline.process_file(path) == "indexed"
+    assert vectors.upserts == 0
+    assert not (store.config.state_dir / "zvec_chunks").exists()
+    hits = store.search("genuine full-text retrieval")
+    assert hits and hits[0].file_path.endswith("fts-only.md")
+    task = state.get_task(str(path))
+    assert task is not None and task.state == "indexed" and task.embedded_at is None
+
+
 def test_process_unchanged_skips(pipe, store, vectors, state, tmp_path):
     path = tmp_path / "same.md"
     path.write_text(MD_BODY, encoding="utf-8")

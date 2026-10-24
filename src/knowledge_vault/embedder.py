@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import urllib.request
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -129,6 +131,40 @@ class BGEM3Embedder:
                 f"encode 返回数量不符：期望 {len(texts)}，收到 {vecs.shape[0]}"
             )
         return l2_normalize(vecs)
+
+
+@dataclass
+class OllamaEmbedder:
+    """Ollama HTTP embedding adapter for a local BGE-M3 model.
+
+    Keeping the model in the existing Ollama service avoids installing PyTorch and
+    CUDA wheels in the knowledge-vault container. The API remains the same
+    ``Embedder`` protocol, and the expected BGE-M3 vector dimension is 1024.
+    """
+
+    model_name: str = "bge-m3"
+    api_base: str = "http://127.0.0.1:11434"
+    timeout: float = 120.0
+    dim: int = BGE_M3_DIM
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        payload = json.dumps({"model": self.model_name, "input": texts}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.api_base.rstrip('/')}/api/embed",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        vectors = np.asarray(result.get("embeddings", []), dtype=np.float32)
+        if vectors.shape != (len(texts), self.dim):
+            raise RuntimeError(
+                f"Ollama embedding shape {vectors.shape} != ({len(texts)}, {self.dim})"
+            )
+        return l2_normalize(vectors)
 
 
 def bge_m3_cache_available(env: dict[str, str] | None = None) -> bool:
